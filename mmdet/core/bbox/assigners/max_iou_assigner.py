@@ -46,7 +46,8 @@ class MaxIoUAssigner(BaseAssigner):
                  ignore_wrt_candidates=True,
                  match_low_quality=True,
                  gpu_assign_thr=-1,
-                 iou_calculator=dict(type='BboxOverlaps2D')):
+                 iou_calculator=dict(type='BboxOverlaps2D'),
+                 main_topk=3):
         self.pos_iou_thr = pos_iou_thr
         self.neg_iou_thr = neg_iou_thr
         self.min_pos_iou = min_pos_iou
@@ -56,6 +57,7 @@ class MaxIoUAssigner(BaseAssigner):
         self.gpu_assign_thr = gpu_assign_thr
         self.match_low_quality = match_low_quality
         self.iou_calculator = build_iou_calculator(iou_calculator)
+        self.main_topk = main_topk
 
     def assign(self, bboxes, gt_bboxes, gt_bboxes_ignore=None, gt_labels=None):
         """Assign gt to bboxes.
@@ -136,15 +138,20 @@ class MaxIoUAssigner(BaseAssigner):
             :obj:`AssignResult`: The assign result.
         """
         num_gts, num_bboxes = overlaps.size(0), overlaps.size(1)
+        #print(overlaps.shape)
 
         # 1. assign -1 by default
         assigned_gt_inds = overlaps.new_full((num_bboxes, ),
                                              -1,
                                              dtype=torch.long)
+                                             
+        assigned_pos_neg_weights = torch.zeros((num_bboxes, ), dtype=torch.double).to(overlaps.device)
 
         if num_gts == 0 or num_bboxes == 0:
             # No ground truth or boxes, return empty assignment
             max_overlaps = overlaps.new_zeros((num_bboxes, ))
+            assigned_pos_neg_inds = torch.zeros((num_bboxes, )).to(overlaps.device)
+            topk_main_pos_inds = torch.zeros((num_bboxes, self.main_topk)).to(overlaps.device)
             if num_gts == 0:
                 # No truth, assign everything to background
                 assigned_gt_inds[:] = 0
@@ -158,7 +165,9 @@ class MaxIoUAssigner(BaseAssigner):
                 num_gts,
                 assigned_gt_inds,
                 max_overlaps,
-                labels=assigned_labels)
+                labels=assigned_labels,
+                pos_neg_inds=assigned_pos_neg_inds,
+                pos_neg_weights=assigned_pos_neg_weights)
 
         # for each anchor, which gt best overlaps with it
         # for each anchor, the max iou of all gts
@@ -207,6 +216,25 @@ class MaxIoUAssigner(BaseAssigner):
                     assigned_gt_inds[pos_inds] - 1]
         else:
             assigned_labels = None
+            
+            
+            
+        # compute weights and assigned gt_inds for hard negtive(>0 & <neg_iou_thr) and positive(>pos_iou_thr) anchors.
+        # For hard negtive anchors, weight = -1./ total_hardnegtive_num; for positive anchors, weight = 1./total_positive_num
+        assigned_pos_neg_weights[(max_overlaps > 0)&(max_overlaps < self.neg_iou_thr)] = -1
+        assigned_pos_neg_weights=torch.div(assigned_pos_neg_weights, (assigned_pos_neg_weights==-1).sum().double())
+        assigned_pos_neg_weights[(max_overlaps > self.pos_iou_thr)] = \
+            torch.div(1, (max_overlaps > self.pos_iou_thr).sum().double())
+
+        assigned_pos_neg_inds=(argmax_overlaps+1)*((assigned_pos_neg_weights!=0).int())
+        
+        # compute topk main positive inds
+        topk_main_pos_inds = torch.zeros((num_bboxes, self.main_topk)).to(overlaps.device)
+        _, topk_inds = overlaps.topk(self.main_topk, 1)
+        for i in range(num_gts):
+            for j in range(self.main_topk):
+                topk_main_pos_inds[topk_inds[i,j], j] = i+1
+        
 
         return AssignResult(
-            num_gts, assigned_gt_inds, max_overlaps, labels=assigned_labels)
+            num_gts, assigned_gt_inds, max_overlaps, labels=assigned_labels, pos_neg_inds=assigned_pos_neg_inds, pos_neg_weights=assigned_pos_neg_weights, topk_main_pos_inds=topk_main_pos_inds)

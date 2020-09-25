@@ -1,18 +1,17 @@
 import torch
 import torch.nn as nn
 from mmcv.cnn import normal_init
-from mmcv.runner import force_fp32
 
 from mmdet.core import (anchor_inside_flags, build_anchor_generator,
                         build_assigner, build_bbox_coder, build_sampler,
-                        images_to_levels, multi_apply, multiclass_nms, unmap)
+                        force_fp32, images_to_levels, multi_apply,
+                        multiclass_nms, unmap)
 from ..builder import HEADS, build_loss
 from .base_dense_head import BaseDenseHead
-from .dense_test_mixins import BBoxTestMixin
 
 
 @HEADS.register_module()
-class AnchorHead(BaseDenseHead, BBoxTestMixin):
+class AnchorHead(BaseDenseHead):
     """Anchor-based head (RPN, RetinaNet, SSD, etc.).
 
     Args:
@@ -55,7 +54,8 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                  loss_bbox=dict(
                      type='SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.0),
                  train_cfg=None,
-                 test_cfg=None):
+                 test_cfg=None,
+                 contra_main_topk=1):
         super(AnchorHead, self).__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
@@ -99,6 +99,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         # usually the numbers of anchors for each level are the same
         # except SSD detectors
         self.num_anchors = self.anchor_generator.num_base_anchors[0]
+        self.contra_main_topk = contra_main_topk
         self._init_layers()
 
     def _init_layers(self):
@@ -241,6 +242,11 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
 
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
+        
+        assigned_pos_neg_inds = assign_result.pos_neg_inds
+        assigned_pos_neg_weights = assign_result.pos_neg_weights
+        topk_main_pos_inds = assign_result.topk_main_pos_inds
+        
         if len(pos_inds) > 0:
             if not self.reg_decoded_bbox:
                 pos_bbox_targets = self.bbox_coder.encode(
@@ -274,9 +280,14 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                                   inside_flags)
             bbox_targets = unmap(bbox_targets, num_total_anchors, inside_flags)
             bbox_weights = unmap(bbox_weights, num_total_anchors, inside_flags)
+            assigned_pos_neg_inds = unmap(assigned_pos_neg_inds, num_total_anchors, inside_flags)
+            assigned_pos_neg_weights = unmap(assigned_pos_neg_weights, num_total_anchors, inside_flags)
+            topk_main_pos_inds = unmap(topk_main_pos_inds, num_total_anchors, inside_flags)
+            #overlaps_unmap = unmap(overlaps.permute(1,0), num_total_anchors, inside_flags)
+        
 
         return (labels, label_weights, bbox_targets, bbox_weights, pos_inds,
-                neg_inds, sampling_result)
+                neg_inds, sampling_result, topk_main_pos_inds, assigned_pos_neg_inds, assigned_pos_neg_weights)
 
     def get_targets(self,
                     anchor_list,
@@ -356,6 +367,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
             unmap_outputs=unmap_outputs)
         (all_labels, all_label_weights, all_bbox_targets, all_bbox_weights,
          pos_inds_list, neg_inds_list, sampling_results_list) = results[:7]
+        #topk_inds_list = results[7]
         rest_results = list(results[7:])  # user-added return values
         # no valid anchors
         if any([labels is None for labels in all_labels]):
@@ -376,12 +388,13 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         if return_sampling_results:
             res = res + (sampling_results_list, )
         for i, r in enumerate(rest_results):  # user-added return values
+            #print(len(r), r[0].shape, r[1].shape)
             rest_results[i] = images_to_levels(r, num_level_anchors)
 
         return res + tuple(rest_results)
 
     def loss_single(self, cls_score, bbox_pred, anchors, labels, label_weights,
-                    bbox_targets, bbox_weights, num_total_samples):
+                    bbox_targets, bbox_weights, topk_main_pos_inds, pos_neg_inds, pos_neg_weights, feat, num_total_samples):
         """Compute loss of a single scale level.
 
         Args:
@@ -425,7 +438,64 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
             bbox_targets,
             bbox_weights,
             avg_factor=num_total_samples)
-        return loss_cls, loss_bbox
+            
+        # contrastive loss
+        cls_feat = feat
+        reg_feat = feat
+        
+        contra_loss_feat = torch.tensor(0.).to(feat.device)
+        contra_loss_cls = torch.tensor(0.).to(feat.device)
+        contra_loss_reg = torch.tensor(0.).to(feat.device)
+        
+        main_pos_inds = topk_main_pos_inds.max(2)[0].contiguous().view(cls_feat.size(0), -1, 9)
+        pos_neg_inds = pos_neg_inds.contiguous().view(cls_feat.size(0), -1, 9)
+        pos_neg_weights = pos_neg_weights.contiguous().view(cls_feat.size(0), -1, 9)
+        
+        main_pos_set = set(main_pos_inds[main_pos_inds!=0].int().data.cpu().numpy())
+        
+        # compute contrastive loss for backbone extracted feats
+        feat_flat = feat.permute(0,2,3,1).reshape(feat.size(0), -1, feat.size(1))
+        for gt_ind in main_pos_set:
+            for idx in range(feat_flat.size(0)):
+                arg_main_pos = (main_pos_inds[idx]==gt_ind).nonzero()
+                if len(arg_main_pos) > 0:
+                    # get the main positive anchor vector
+                    main_pos_mean = feat_flat[idx][arg_main_pos[:,0]].mean(0).detach()
+                    loss_weight = pos_neg_weights[idx].mean(-1)*(pos_neg_inds[idx]==gt_ind).max(-1)[0]
+                    contra_loss_feat += (((feat_flat[idx]-main_pos_mean.unsqueeze(0))*(feat_flat[idx]-
+                                                                              main_pos_mean.unsqueeze(0))).sum(-1)*loss_weight).sum()
+        
+        # compute contrastive loss for cls feats
+        for cls_conv in self.cls_convs:
+            cls_feat = cls_conv(cls_feat)
+            cls_feat_flat = cls_feat.permute(0,2,3,1).reshape(cls_feat.size(0), -1, cls_feat.size(1))
+            for gt_ind in main_pos_set:
+                for idx in range(cls_feat_flat.size(0)):
+                    arg_main_pos = (main_pos_inds[idx]==gt_ind).nonzero()
+                    if len(arg_main_pos) > 0:
+                        main_pos_mean = cls_feat_flat[idx][arg_main_pos[:,0]].mean(0).detach()
+                        loss_weight = pos_neg_weights[idx].mean(-1)*(pos_neg_inds[idx]==gt_ind).max(-1)[0]
+                        loss = (((cls_feat_flat[idx]-main_pos_mean.unsqueeze(0))*(cls_feat_flat[idx]-
+                                                                              main_pos_mean.unsqueeze(0))).sum(-1)*loss_weight).sum()
+                        contra_loss_cls += loss
+        
+        # compute contrastive loss for reg feats
+        for reg_conv in self.reg_convs:
+            reg_feat = reg_conv(reg_feat)
+            reg_feat_flat = reg_feat.permute(0,2,3,1).reshape(reg_feat.size(0), -1, reg_feat.size(1))
+            for gt_ind in main_pos_set:
+                for idx in range(reg_feat_flat.size(0)):
+                    arg_main_pos = (main_pos_inds[idx]==gt_ind).nonzero()
+                    if len(arg_main_pos) > 0:
+                        main_pos_mean = reg_feat_flat[idx][arg_main_pos[:,0]].mean(0).detach()
+                        loss_weight = pos_neg_weights[idx].mean(-1)*(pos_neg_inds[idx]==gt_ind).max(-1)[0]
+                        loss = (((reg_feat_flat[idx]-main_pos_mean.unsqueeze(0))*(reg_feat_flat[idx]-
+                                                                              main_pos_mean.unsqueeze(0))).sum(-1)*loss_weight).sum()
+                        contra_loss_reg += loss
+                        
+        loss_contra = contra_loss_feat+contra_loss_cls+contra_loss_reg
+        
+        return loss_cls, loss_bbox, loss_contra
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
     def loss(self,
@@ -434,6 +504,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
              gt_bboxes,
              gt_labels,
              img_metas,
+             feats,
              gt_bboxes_ignore=None):
         """Compute losses of the head.
 
@@ -472,7 +543,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         if cls_reg_targets is None:
             return None
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
-         num_total_pos, num_total_neg) = cls_reg_targets
+         num_total_pos, num_total_neg, topk_main_pos_inds_list, pos_neg_inds_list, pos_neg_weights_list) = cls_reg_targets
         num_total_samples = (
             num_total_pos + num_total_neg if self.sampling else num_total_pos)
 
@@ -485,7 +556,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         all_anchor_list = images_to_levels(concat_anchor_list,
                                            num_level_anchors)
 
-        losses_cls, losses_bbox = multi_apply(
+        losses_cls, losses_bbox, losses_contra= multi_apply(
             self.loss_single,
             cls_scores,
             bbox_preds,
@@ -494,8 +565,12 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
             label_weights_list,
             bbox_targets_list,
             bbox_weights_list,
+            topk_main_pos_inds_list,
+            pos_neg_inds_list,
+            pos_neg_weights_list,
+            feats,
             num_total_samples=num_total_samples)
-        return dict(loss_cls=losses_cls, loss_bbox=losses_bbox)
+        return dict(loss_cls=losses_cls, loss_bbox=losses_bbox, loss_contra=losses_contra)
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
     def get_bboxes(self,
@@ -503,8 +578,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                    bbox_preds,
                    img_metas,
                    cfg=None,
-                   rescale=False,
-                   with_nms=True):
+                   rescale=False):
         """Transform network output for a batch into bbox predictions.
 
         Args:
@@ -518,8 +592,6 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                 if None, test_cfg would be used
             rescale (bool): If True, return boxes in original image space.
                 Default: False.
-            with_nms (bool): If True, do nms before return boxes.
-                Default: True.
 
         Returns:
             list[tuple[Tensor, Tensor]]: Each item in result_list is 2-tuple.
@@ -573,18 +645,9 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
             ]
             img_shape = img_metas[img_id]['img_shape']
             scale_factor = img_metas[img_id]['scale_factor']
-            if with_nms:
-                # some heads don't support with_nms argument
-                proposals = self._get_bboxes_single(cls_score_list,
-                                                    bbox_pred_list,
-                                                    mlvl_anchors, img_shape,
-                                                    scale_factor, cfg, rescale)
-            else:
-                proposals = self._get_bboxes_single(cls_score_list,
-                                                    bbox_pred_list,
-                                                    mlvl_anchors, img_shape,
-                                                    scale_factor, cfg, rescale,
-                                                    with_nms)
+            proposals = self._get_bboxes_single(cls_score_list, bbox_pred_list,
+                                                mlvl_anchors, img_shape,
+                                                scale_factor, cfg, rescale)
             result_list.append(proposals)
         return result_list
 
@@ -595,8 +658,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                            img_shape,
                            scale_factor,
                            cfg,
-                           rescale=False,
-                           with_nms=True):
+                           rescale=False):
         """Transform outputs for a single batch item into bbox predictions.
 
         Args:
@@ -613,9 +675,6 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
             cfg (mmcv.Config): Test / postprocessing configuration,
                 if None, test_cfg would be used.
             rescale (bool): If True, return boxes in original image space.
-                Default: False.
-            with_nms (bool): If True, do nms before return boxes.
-                Default: True.
 
         Returns:
             Tensor: Labeled boxes in shape (n, 5), where the first 4 columns
@@ -664,29 +723,8 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
             # BG cat_id: num_class
             padding = mlvl_scores.new_zeros(mlvl_scores.shape[0], 1)
             mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
+        det_bboxes, det_labels = multiclass_nms(mlvl_bboxes, mlvl_scores,
+                                                cfg.score_thr, cfg.nms,
+                                                cfg.max_per_img)
+        return det_bboxes, det_labels
 
-        if with_nms:
-            det_bboxes, det_labels = multiclass_nms(mlvl_bboxes, mlvl_scores,
-                                                    cfg.score_thr, cfg.nms,
-                                                    cfg.max_per_img)
-            return det_bboxes, det_labels
-        else:
-            return mlvl_bboxes, mlvl_scores
-
-    def aug_test(self, feats, img_metas, rescale=False):
-        """Test function with test time augmentation.
-
-        Args:
-            feats (list[Tensor]): the outer list indicates test-time
-                augmentations and inner Tensor should have a shape NxCxHxW,
-                which contains features for all images in the batch.
-            img_metas (list[list[dict]]): the outer list indicates test-time
-                augs (multiscale, flip, etc.) and the inner list indicates
-                images in a batch. each dict has image information.
-            rescale (bool, optional): Whether to rescale the results.
-                Defaults to False.
-
-        Returns:
-            list[ndarray]: bbox results of each class
-        """
-        return self.aug_test_bboxes(feats, img_metas, rescale=rescale)

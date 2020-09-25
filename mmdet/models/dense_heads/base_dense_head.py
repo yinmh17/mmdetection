@@ -48,9 +48,9 @@ class BaseDenseHead(nn.Module, metaclass=ABCMeta):
         """
         outs = self(x)
         if gt_labels is None:
-            loss_inputs = outs + (gt_bboxes, img_metas)
+            loss_inputs = outs + (gt_bboxes, img_metas, x)
         else:
-            loss_inputs = outs + (gt_bboxes, gt_labels, img_metas)
+            loss_inputs = outs + (gt_bboxes, gt_labels, img_metas, x)
         losses = self.loss(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
         if proposal_cfg is None:
             return losses

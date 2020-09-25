@@ -39,13 +39,17 @@ class AssignResult(util_mixins.NiceRepr):
                       labels.shape=(7,))>
     """
 
-    def __init__(self, num_gts, gt_inds, max_overlaps, labels=None):
+    def __init__(self, num_gts, gt_inds, max_overlaps, labels=None, pos_neg_inds=None, pos_neg_weights=None, overlaps=None, topk_main_pos_inds=None):
         self.num_gts = num_gts
         self.gt_inds = gt_inds
         self.max_overlaps = max_overlaps
         self.labels = labels
         # Interface for possible user-defined properties
         self._extra_properties = {}
+        self.pos_neg_inds = pos_neg_inds
+        self.pos_neg_weights = pos_neg_weights
+        self.overlaps = overlaps
+        self.topk_main_pos_inds = topk_main_pos_inds
 
     @property
     def num_preds(self):
@@ -70,6 +74,10 @@ class AssignResult(util_mixins.NiceRepr):
             'gt_inds': self.gt_inds,
             'max_overlaps': self.max_overlaps,
             'labels': self.labels,
+            'pos_neg_inds': self.pos_neg_inds,
+            'pos_neg_weights': self.pos_neg_weights,
+            'overlaps': self.overlaps,
+            'topk_main_pos_inds': self.topk_main_pos_inds
         }
         basic_info.update(self._extra_properties)
         return basic_info
