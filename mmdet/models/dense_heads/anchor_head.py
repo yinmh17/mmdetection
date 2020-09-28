@@ -464,8 +464,8 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                     # get the main positive anchor vector
                     main_pos_mean = feat_flat[idx][arg_main_pos[:,0]].mean(0).detach()
                     loss_weight = pos_neg_weights[idx].mean(-1)*(pos_neg_inds[idx]==gt_ind).max(-1)[0]
-                    contra_loss_feat += (((feat_flat[idx]-main_pos_mean.unsqueeze(0))*(feat_flat[idx]-
-                                                                              main_pos_mean.unsqueeze(0))).sum(-1)*loss_weight).sum()
+                    loss = (self.contra_loss_func(feat_flat[idx], main_pos_mean)*loss_weight.unsqueeze(1)).sum()
+                    contra_loss_feat += loss
         
         # compute contrastive loss for cls feats
         for cls_conv in self.cls_convs:
@@ -477,8 +477,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                     if len(arg_main_pos) > 0:
                         main_pos_mean = cls_feat_flat[idx][arg_main_pos[:,0]].mean(0).detach()
                         loss_weight = pos_neg_weights[idx].mean(-1)*(pos_neg_inds[idx]==gt_ind).max(-1)[0]
-                        loss = (((cls_feat_flat[idx]-main_pos_mean.unsqueeze(0))*(cls_feat_flat[idx]-
-                                                                              main_pos_mean.unsqueeze(0))).sum(-1)*loss_weight).sum()
+                        loss = (self.contra_loss_func(cls_feat_flat[idx], main_pos_mean)*loss_weight.unsqueeze(1)).sum()
                         contra_loss_cls += loss
         
         # compute contrastive loss for reg feats
@@ -491,8 +490,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                     if len(arg_main_pos) > 0:
                         main_pos_mean = reg_feat_flat[idx][arg_main_pos[:,0]].mean(0).detach()
                         loss_weight = pos_neg_weights[idx].mean(-1)*(pos_neg_inds[idx]==gt_ind).max(-1)[0]
-                        loss = (((reg_feat_flat[idx]-main_pos_mean.unsqueeze(0))*(reg_feat_flat[idx]-
-                                                                              main_pos_mean.unsqueeze(0))).sum(-1)*loss_weight).sum()
+                        loss = (self.contra_loss_func(reg_feat_flat[idx], main_pos_mean)*loss_weight.unsqueeze(1)).sum()
                         contra_loss_reg += loss
                         
         loss_contra = contra_loss_feat+contra_loss_cls+contra_loss_reg
