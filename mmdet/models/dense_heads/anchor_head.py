@@ -455,6 +455,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
         
         main_pos_set = set(main_pos_inds[main_pos_inds!=0].int().data.cpu().numpy())
         
+        thres = torch.tensor([2.5]).to(feat.device)
         # compute contrastive loss for backbone extracted feats
         feat_flat = feat.permute(0,2,3,1).reshape(feat.size(0), -1, feat.size(1))
         for gt_ind in main_pos_set:
@@ -464,7 +465,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                     # get the main positive anchor vector
                     main_pos_mean = feat_flat[idx][arg_main_pos[:,0]].mean(0).detach()
                     loss_weight = pos_neg_weights[idx].mean(-1)*(pos_neg_inds[idx]==gt_ind).max(-1)[0]
-                    loss = (self.contra_loss_func(feat_flat[idx], main_pos_mean)*loss_weight.unsqueeze(1)).sum()
+                    loss = (torch.min(self.contra_loss_func(feat_flat[idx], main_pos_mean).sum(-1), thres)*loss_weight).sum()
                     contra_loss_feat += loss
         
         # compute contrastive loss for cls feats
@@ -477,7 +478,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                     if len(arg_main_pos) > 0:
                         main_pos_mean = cls_feat_flat[idx][arg_main_pos[:,0]].mean(0).detach()
                         loss_weight = pos_neg_weights[idx].mean(-1)*(pos_neg_inds[idx]==gt_ind).max(-1)[0]
-                        loss = (self.contra_loss_func(cls_feat_flat[idx], main_pos_mean)*loss_weight.unsqueeze(1)).sum()
+                        loss = (torch.min(self.contra_loss_func(cls_feat_flat[idx], main_pos_mean).sum(-1), thres)*loss_weight).sum()
                         contra_loss_cls += loss
         
         # compute contrastive loss for reg feats
@@ -490,7 +491,7 @@ class AnchorHead(BaseDenseHead, BBoxTestMixin):
                     if len(arg_main_pos) > 0:
                         main_pos_mean = reg_feat_flat[idx][arg_main_pos[:,0]].mean(0).detach()
                         loss_weight = pos_neg_weights[idx].mean(-1)*(pos_neg_inds[idx]==gt_ind).max(-1)[0]
-                        loss = (self.contra_loss_func(reg_feat_flat[idx], main_pos_mean)*loss_weight.unsqueeze(1)).sum()
+                        loss = (torch.min(self.contra_loss_func(reg_feat_flat[idx], main_pos_mean).sum(-1), thres)*loss_weight).sum()
                         contra_loss_reg += loss
                         
         loss_contra = contra_loss_feat+contra_loss_cls+contra_loss_reg
